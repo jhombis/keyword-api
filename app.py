@@ -294,10 +294,12 @@ def forecast():
             ag.biddable_keywords.append(bk)
         camp.ad_groups.append(ag)
 
-        # Forecast period: the next full calendar month (like the Planner UI)
+        # Forecast period: a FIXED 30-day window starting on the 1st of next
+        # month — matches the business convention (client monthly = daily × 30)
+        # so costs reconcile exactly regardless of how many days the month has.
         today = date.today()
         first_next = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
-        last_next = (first_next + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        last_next = first_next + timedelta(days=29)   # 30 days inclusive
         req.forecast_period.start_date = first_next.isoformat()
         req.forecast_period.end_date = last_next.isoformat()
 
