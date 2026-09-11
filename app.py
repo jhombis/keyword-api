@@ -329,6 +329,98 @@ def forecast():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/forecast_curve', methods=['OPTIONS'])
+def forecast_curve_options():
+    return '', 200
+
+
+@app.route('/api/forecast_curve', methods=['POST'])
+def forecast_curve():
+    """Approximates the Keyword Planner forecast curve by sampling
+    GenerateKeywordForecastMetrics at several daily budgets (in parallel).
+
+    Body: { keywords, cities, match_type, strategy, daily_budgets: [floats, max 10] }
+    Returns: { period, points: [{daily_budget, clicks, conversions, cost, impressions}] }
+    """
+    try:
+        from datetime import date, timedelta
+        from concurrent.futures import ThreadPoolExecutor
+
+        body = request.get_json() or {}
+        kws = body.get('keywords', [])
+        if not kws:
+            return jsonify({'error': 'No keywords provided'}), 400
+        try:
+            budgets = [float(b) for b in (body.get('daily_budgets') or []) if float(b) > 0][:10]
+        except (TypeError, ValueError):
+            budgets = []
+        if not budgets:
+            return jsonify({'error': 'No daily_budgets provided'}), 400
+
+        cities = body.get('cities', [])
+        geo = lookup_geo_targets(cities) if cities else None
+        if not geo:
+            geo = ['geoTargetConstants/2840']
+
+        match_name = (body.get('match_type') or 'PHRASE').upper()
+        if match_name not in ('PHRASE', 'BROAD', 'EXACT'):
+            match_name = 'PHRASE'
+        strategy = (body.get('strategy') or 'maximize_conversions').lower()
+        if strategy not in ('maximize_conversions', 'maximize_clicks'):
+            strategy = 'maximize_conversions'
+
+        today = date.today()
+        first_next = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+        last_next = first_next + timedelta(days=29)   # fixed 30-day window
+
+        kp_service = _ads_client.get_service('KeywordPlanIdeaService')
+        match_enum = getattr(_ads_client.enums.KeywordMatchTypeEnum, match_name)
+
+        def sample(db):
+            req = _ads_client.get_type('GenerateKeywordForecastMetricsRequest')
+            req.customer_id = CUSTOMER_ID
+            camp = req.campaign
+            camp.language_constants.append('languageConstants/1000')
+            camp.keyword_plan_network = _ads_client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
+            for g in geo:
+                mod = _ads_client.get_type('CriterionBidModifier')
+                mod.geo_target_constant = g
+                camp.geo_modifiers.append(mod)
+            if strategy == 'maximize_clicks':
+                camp.bidding_strategy.maximize_clicks_bidding_strategy.daily_target_spend_micros = int(db * 1_000_000)
+            else:
+                camp.bidding_strategy.maximize_conversions_bidding_strategy.daily_target_spend_micros = int(db * 1_000_000)
+            ag = _ads_client.get_type('ForecastAdGroup')
+            for kw in kws:
+                bk = _ads_client.get_type('BiddableKeyword')
+                bk.keyword.text = kw
+                bk.keyword.match_type = match_enum
+                ag.biddable_keywords.append(bk)
+            camp.ad_groups.append(ag)
+            req.forecast_period.start_date = first_next.isoformat()
+            req.forecast_period.end_date = last_next.isoformat()
+            m = kp_service.generate_keyword_forecast_metrics(request=req).campaign_forecast_metrics
+            return {
+                'daily_budget': db,
+                'clicks': round(m.clicks, 1),
+                'conversions': round(m.conversions, 1),
+                'cost': round((m.cost_micros or 0) / 1_000_000, 2),
+                'impressions': round(m.impressions, 1)
+            }
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            points = list(ex.map(sample, budgets))   # order preserved
+
+        return jsonify({
+            'period': {'start': first_next.isoformat(), 'end': last_next.isoformat()},
+            'points': points
+        })
+
+    except Exception as e:
+        print(f"[Curve Error] {type(e).__name__}: {e}", file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok', 'customer_id': CUSTOMER_ID[:4] + '...'})
