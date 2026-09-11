@@ -343,8 +343,8 @@ def forecast_curve():
     Returns: { period, points: [{daily_budget, clicks, conversions, cost, impressions}] }
     """
     try:
+        import time as _time
         from datetime import date, timedelta
-        from concurrent.futures import ThreadPoolExecutor
 
         body = request.get_json() or {}
         kws = body.get('keywords', [])
@@ -376,7 +376,7 @@ def forecast_curve():
         kp_service = _ads_client.get_service('KeywordPlanIdeaService')
         match_enum = getattr(_ads_client.enums.KeywordMatchTypeEnum, match_name)
 
-        def sample(db):
+        def sample(db, tries=4):
             req = _ads_client.get_type('GenerateKeywordForecastMetricsRequest')
             req.customer_id = CUSTOMER_ID
             camp = req.campaign
@@ -399,17 +399,33 @@ def forecast_curve():
             camp.ad_groups.append(ag)
             req.forecast_period.start_date = first_next.isoformat()
             req.forecast_period.end_date = last_next.isoformat()
-            m = kp_service.generate_keyword_forecast_metrics(request=req).campaign_forecast_metrics
-            return {
-                'daily_budget': db,
-                'clicks': round(m.clicks, 1),
-                'conversions': round(m.conversions, 1),
-                'cost': round((m.cost_micros or 0) / 1_000_000, 2),
-                'impressions': round(m.impressions, 1)
-            }
+            # The forecast method has a strict requests-per-minute quota, so on
+            # RESOURCE_EXHAUSTED we back off and retry instead of failing.
+            for attempt in range(tries):
+                try:
+                    m = kp_service.generate_keyword_forecast_metrics(request=req).campaign_forecast_metrics
+                    return {
+                        'daily_budget': db,
+                        'clicks': round(m.clicks, 1),
+                        'conversions': round(m.conversions, 1),
+                        'cost': round((m.cost_micros or 0) / 1_000_000, 2),
+                        'impressions': round(m.impressions, 1)
+                    }
+                except Exception as e:
+                    msg = str(e)
+                    rate_limited = 'RESOURCE_EXHAUSTED' in msg or 'Too many requests' in msg or 'exhausted' in msg
+                    if rate_limited and attempt < tries - 1:
+                        _time.sleep(5 * (attempt + 1))
+                        continue
+                    raise
 
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            points = list(ex.map(sample, budgets))   # order preserved
+        # SEQUENTIAL sampling with spacing — parallel calls trip the
+        # per-method rate limit of the Google Ads API developer token.
+        points = []
+        for i, db in enumerate(budgets):
+            if i:
+                _time.sleep(1.5)
+            points.append(sample(db))
 
         return jsonify({
             'period': {'start': first_next.isoformat(), 'end': last_next.isoformat()},
